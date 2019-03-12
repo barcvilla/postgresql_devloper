@@ -47,7 +47,7 @@ LANGUAGE plpgsql;
 
 CREATE TRIGGER valida_products 
 -- indicamos el momento en el que hacemos la validacion (DISPARO DEL TRIGGER y las accion que va analizar el TRIGGER)
-BEFORE INSERT OR UPDATE
+BEFORE INSERT OR UPDATE -- antes de INSERT OR UPDATE se debe ejecutar la funcion de validacion
 ON productos
 -- El trigger va escuchar por cada registro que tenga la tabla'
 FOR EACH ROW EXECUTE PROCEDURE valida_products();
