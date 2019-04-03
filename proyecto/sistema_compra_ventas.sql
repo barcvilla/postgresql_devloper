@@ -142,12 +142,213 @@ create or replace function autenticacion(_usuario character varying, _clave char
 returns table(id_usuario smallint, nombre character varying, id_perfil smallint, perfil character varying) as
 $body$
 begin
-	return query select a.id_usuarios, a.nombre, b.id_perfil, b.perfil from usuarios as a natural join perfiles as b
-	where a.usuarios = _usuarios and a.clave = md5(_clave);
+	return query select a.id_usuario, a.nombre, b.id_perfil, b.perfil from usuarios as a natural join perfiles as b
+	where a.usuario = _usuario and a.clave = md5(_clave);
 	if not found then
 		raise exception 'El usuario o password no coincide';
 	end if;
 end;
 $body$
 language plpgsql;
-alter function consulta_terceros() owner to escueladigital;
+alter function autenticacion(_usuario character varying, _clave character varying) owner to escueladigital;
+
+-- Llamada de la funcion autenticacion desde un Backend
+select id_usuario, nombre, id_perfil, perfil from autenticacion('alozada', 'clave123+')
+
+-- Realizacion de Auditoria: En este utilizamos triggers ya que no tenemos certeza cuando se realice un INSERT, DELETE O UPDATE de la informacion en las tablas
+-- Funcion Trigger para Auditoria de Productos
+CREATE OR REPLACE FUNCTION tg_productos_auditoria()
+RETURNS TRIGGER AS
+$BODY$
+BEGIN
+	IF TG_OP = 'UPDATE' THEN
+		INSERT INTO auditoria (id_usuario, accion, tabla, anterior, nuevo)
+		SELECT NEW.id_usuario, 'ACTUALIZAR', 'PRODUCTO', row_to_json(OLD.*), row_to_json(NEW.*);
+	END IF;
+	RETURN NEW;
+END;
+$BODY$
+LANGUAGE plpgsql;
+
+-- TRIGGER AUDITORÍA PRODUCTOS
+CREATE TRIGGER tg_productos_auditoria
+AFTER UPDATE ON productos
+FOR EACH ROW EXECUTE PROCEDURE tg_productos_auditoria();
+
+
+-- Funcion Trigger para Auditoria de Compras
+create or replace function tg_compras_auditoria()
+returns trigger as
+$body$
+begin
+	if tg_op = 'INSERT' then --cuando se realiza un update
+		insert into auditoria(id_usuario, accion, tabla, anterior, nuevo)
+		select NEW.id_usuario, 'insertar', 'compras', row_to_json(NEW.*), null;
+	end if;
+	return NEW;
+end;
+$body$
+language plpgsql;
+alter function tg_compras_auditoria() owner to escueladigital;
+
+-- Trigger Auditoria de Compras
+create trigger tg_compras_auditoria
+after insert on compras
+for each row execute procedure tg_compras_auditoria();
+
+-- Funcion Comprar
+-- retorna idcomprar o factura de compra que genera el sistema
+create or replace function comprar(_proveedor smallint, _producto smallint, _cantidad smallint, _valor smallint, _usuario smallint)
+returns smallint as 
+$body$
+declare 
+	_idfactura smallint;
+begin
+	-- Insertamos el registro de compras. Returning nos puede retornar todo el registro que se esta insertando
+	insert into compras(id_tercero, id_producto, cantidad, valor, id_usuario)
+	values(_proveedor, _producto, _cantidad, _valor, _usuario) returning id_compra into _idfactura;
+	-- En postgres si una accion select, insert, update, delete se realiza exitosamente found es true
+	if found then
+		-- se actualiza el stock
+		update productos set cantidad = cantidad + _cantidad, precio = _valor, id_usuario = _usuario where id_producto = _producto;
+	else
+		raise exception 'No fue posible insertar el registro de compras';
+	end if;
+	return _idfactura;
+end;
+$body$
+language plpgsql;
+alter function comprar(_cliente smallint, _producto smallint, _cantidad smallint, _valor smallint, _usuario smallint) owner to escueladigital;
+
+-- Funcion Trigger para la Auditoria de Ventas
+create or replace function tg_ventas_auditoria()
+returns trigger as
+$body$
+begin
+	if tg_op = 'INSERT' then
+		insert into auditoria(id_usuario, accion, tabla, anterior, nuevo)
+		select NEW.id_usuario, 'Insertar', 'Ventas', row_to_json(NEW.*), null;
+	end if;
+	return NEW;
+end;
+$body$
+language plpgsql;
+alter function tg_ventas_auditoria() owner to escueladigital;
+
+-- Trigger de Auditoria de Ventas
+create trigger tg_ventas_auditoria
+after insert on ventas
+for each row execute procedure tg_ventas_auditoria();
+
+-- Funcion de Ventas
+create or replace function vender(_cliente smallint, _producto smallint, _cantidad smallint, _usuario smallint)
+returns smallint as
+$body$
+declare
+	_valor smallint; --almacenamos el valor de venta
+	_existencia smallint; --nos permite saber si tenemos el suficiente stock para vender
+	_idfactura smallint; -- variable que almacena la factura de venta
+begin
+	-- se busca el precio de venta y se valida si hay stock de ventas
+	-- al precio le aumentamos el 30%, si el resultado es de tipo double o real se realiza un CAST para convertir el valor a tipo entero
+	select cast(precio * 1.3 as smallint), cantidad
+	-- _valor almacena precio * 1.3
+	-- _existencia almacena cantidad
+	-- strict nos permite asegurarnos que nos devolvera un solo registro
+	into strict _valor, _existencia from productos where id_producto = _producto;
+
+	-- si hay suficiente stock
+	if _existencia >= _cantidad then
+		-- se inserta el registro de ventas
+		insert into ventas(id_tercero, id_producto, cantidad, valor, id_usuario) values(_cliente, _producto, _cantidad, _valor, _usuario)
+		returning id_venta into _idfactura; --retornamos el id_venta y lo guardamos en _idfactura
+		-- found significa: si la sentencia previa se ejecuto exitosamente
+		if found then
+			--se actualiza el stock del producto
+			update productos set cantidad = cantidad - _cantidad, id_usuario = _usuario where id_producto = _producto;
+		else
+			raise exception 'no fue posible insertar el registro de ventas %';
+		end if;
+	else
+		raise exception 'No existe suficiente cantidad para la venta %', _existencia;
+	end if;
+	
+	return _idfactura;
+
+	exception
+	-- lanzamos excepcion cuando no se encuentra informacion del select cast(precio * 1.3 as smallint), cantidad
+	when NO_DATA_FOUND then
+		raise exception 'No se encontro el producto a vender';
+end;
+$body$
+language plpgsql;
+alter function vender(_cliente smallint, _producto smallint, _cantidad smallint, _usuario smallint) owner to escueladigital;
+
+-- Funciones de Consulta con Paginacion
+-- Consulta Ventas
+create or replace function consulta_ventas(_limite smallint, _pagina smallint)
+returns table(id_venta smallint, fecha date, cliente character varying, producto character varying, cantidad smallint, valor smallint)
+as
+$body$
+declare
+	_inicio smallint;
+begin
+	_inicio = _limite * _pagina - _limite;
+	
+	return query select v.id_venta, v.fecha, t.nombre as proveedor, p.nombre as producto, v.cantidad, v.valor from ventas as v
+	inner join terceros as t on v.id_tercero = t.id_tercero
+	inner join productos as p on v.id_producto = p.id_producto
+	limit _limite -- en mysql basta con colocar limit _limite, _inicio para hacer la pagiacion
+	offset _inicio;	
+end;
+$body$
+language plpgsql;
+alter function consulta_ventas(_limite smallint, _pagina smallint) owner to escueladigital;
+
+-- Consulta de Compras
+create or replace function consulta_compras(_limite smallint, _pagina smallint)
+returns table(id_compra smallint, fecha date, cliente character varying, producto character varying, cantidad smallint, valor smallint)
+as
+$body$
+declare
+	_inicio smallint;
+begin
+	_inicio = _limite * _pagina - _limite;
+
+	return query select c.id_compra, c.fecha, t.nombre as cliente, p.nombre as producto, c.cantidad, c.valor from compras as c
+	inner join terceros as t on c.id_tercero = t.id_tercero
+	inner join productos as p on c.id_producto = p.id_producto
+	limit _limite
+	offset _inicio;
+end;
+$body$
+language plpgsql;
+alter function consulta_compras(_limite smallint, _pagina smallint) owner to escueladigital;
+
+-- Consulta Inventario actual
+create or replace function consulta_inventario(_limite smallint, _pagina smallint)
+returns setof productos as
+$body$
+declare
+	_inicio smallint;
+begin
+	_inicio = _limite * _pagina - _limite;
+	return  query select id_producto, nombre, cantidad, precio, id_usuario from productos order by id_producto limit _limite offset _inicio;
+end;
+$body$
+language plpgsql;
+alter function consulta_inventario(_limite smallint, _pagina smallint) owner to escueladigital;
+
+-- Prueba de las funciones
+select * from ventas;
+select * from compras;
+select * from productos;
+select * from terceros;
+select * from auditoria;
+
+-- Simulamos llamadas desde el Backend
+-- Ejecutamos la funcion comprar. Esta funcion me retorna un numero por esa razon no utilizamos * from 
+-- Comprar(id_tercero, id_producto, cantidad, valor, id_usuario)
+select comprar(2::smallint, 2::smallint, 1::smallint, 13500::smallint, 2::smallint);
+
+select vender(1:: smallint, 1::smallint, 2::smallint, 1::smallint);
